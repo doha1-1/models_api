@@ -18,6 +18,12 @@ HF_TOKEN = os.getenv("HF_TOKEN")
 REPO_ID = "doha14/brain-tumor-models"
 
 # =========================
+# Global Models
+# =========================
+clf_model = None
+seg_model = None
+
+# =========================
 # Custom Loss Functions
 # =========================
 def dice_coef(y_true, y_pred, smooth=1e-6):
@@ -36,30 +42,27 @@ def bce_dice_loss(y_true, y_pred):
     return bce(y_true, y_pred) + dice_loss(y_true, y_pred)
 
 # =========================
-# Global Models (IMPORTANT)
-# =========================
-clf_model = None
-seg_model = None
-
-# =========================
-# Load Models ONCE (FIX)
+# SAFE MODEL LOADING
 # =========================
 def load_models():
     global clf_model, seg_model
 
-    if clf_model is None:
+    print("Loading models from HuggingFace...")
+
+    try:
         clf_path = hf_hub_download(
             repo_id=REPO_ID,
             filename="final_brisc_classifier_v2.keras",
-            token=HF_TOKEN
+            token=HF_TOKEN,
+            local_files_only=False
         )
         clf_model = tf.keras.models.load_model(clf_path, compile=False)
 
-    if seg_model is None:
         seg_path = hf_hub_download(
             repo_id=REPO_ID,
             filename="2D_unet_segmentation_model.keras",
-            token=HF_TOKEN
+            token=HF_TOKEN,
+            local_files_only=False
         )
         seg_model = tf.keras.models.load_model(
             seg_path,
@@ -71,25 +74,28 @@ def load_models():
             compile=False
         )
 
-    return clf_model, seg_model
+        print("Models loaded successfully.")
+
+    except Exception as e:
+        print("MODEL LOAD FAILED:", str(e))
+        raise e
 
 # =========================
-# LOAD MODELS AT STARTUP (CRITICAL FIX)
+# FORCE LOAD AT STARTUP
 # =========================
 @app.on_event("startup")
 def startup():
-    global clf_model, seg_model
-    clf_model, seg_model = load_models()
+    load_models()
 
 # =========================
-# Constants
+# CONSTANTS
 # =========================
 CLASS_NAMES = ['glioma', 'meningioma', 'no_tumor', 'pituitary']
 CLASS_SIZE = (300, 300)
 SEG_SIZE = (256, 256)
 
 # =========================
-# Preprocessing
+# PREPROCESSING
 # =========================
 def preprocess_classification(img):
     img = cv2.resize(img, CLASS_SIZE)
@@ -102,7 +108,7 @@ def preprocess_segmentation(img):
     return np.expand_dims(img, axis=0)
 
 # =========================
-# Postprocessing
+# POSTPROCESSING
 # =========================
 def clean_mask(mask, threshold=0.5):
     return (mask > threshold).astype(np.uint8)
@@ -120,12 +126,24 @@ def create_overlay(image, mask):
     return overlay
 
 # =========================
-# API ENDPOINT
+# HEALTH CHECK (IMPORTANT)
+# =========================
+@app.get("/")
+def home():
+    return {"status": "API running"}
+
+# =========================
+# PREDICT ENDPOINT
 # =========================
 @app.post("/predict")
 async def predict(file: UploadFile = File(...)):
     try:
+        print("Request received")
+
         global clf_model, seg_model
+
+        if clf_model is None or seg_model is None:
+            load_models()
 
         # Read image
         image_bytes = await file.read()
@@ -136,7 +154,7 @@ async def predict(file: UploadFile = File(...)):
         # Classification
         # =========================
         clf_input = preprocess_classification(img)
-        preds = clf_model.predict(clf_input)[0]
+        preds = clf_model.predict(clf_input, verbose=0)[0]
 
         pred_idx = int(np.argmax(preds))
         pred_class = CLASS_NAMES[pred_idx]
@@ -150,7 +168,7 @@ async def predict(file: UploadFile = File(...)):
 
         else:
             seg_input = preprocess_segmentation(img)
-            seg_output = seg_model.predict(seg_input)
+            seg_output = seg_model.predict(seg_input, verbose=0)
 
             if seg_output.shape[-1] == 1:
                 seg_pred = seg_output[0, :, :, 0]
@@ -184,6 +202,7 @@ async def predict(file: UploadFile = File(...)):
         }
 
     except Exception as e:
+        print("ERROR:", str(e))
         return {
             "error": str(e),
             "trace": traceback.format_exc()
