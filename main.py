@@ -2,12 +2,14 @@ from fastapi import FastAPI, UploadFile, File
 import numpy as np
 import cv2
 import os
+
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 os.environ["TF_FORCE_GPU_ALLOW_GROWTH"] = "true"
+
 import tensorflow as tf
 from PIL import Image
 from io import BytesIO
-from huggingface_hub import hf_hub_download
+from huggingface_hub import snapshot_download
 import traceback
 import base64
 
@@ -18,6 +20,9 @@ app = FastAPI(title="Brain Tumor AI API")
 # =========================
 HF_TOKEN = os.getenv("HF_TOKEN")
 REPO_ID = "doha14/brain-tumor-models"
+
+# Cache model download ONCE
+MODEL_DIR = None
 
 # =========================
 # Global Models
@@ -44,46 +49,47 @@ def bce_dice_loss(y_true, y_pred):
     return bce(y_true, y_pred) + dice_loss(y_true, y_pred)
 
 # =========================
-# SAFE MODEL LOADING
+# LOAD MODELS (FIXED)
 # =========================
 def load_models():
-    global clf_model, seg_model
+    global clf_model, seg_model, MODEL_DIR
 
-    print("Loading models from HuggingFace...")
+    print("Loading models...")
+
+    # Download ONCE and reuse cache
+    if MODEL_DIR is None:
+        MODEL_DIR = snapshot_download(
+            repo_id=REPO_ID,
+            token=HF_TOKEN,
+            cache_dir="/tmp/models"
+        )
 
     try:
-        clf_path = hf_hub_download(
-            repo_id=REPO_ID,
-            filename="final_brisc_classifier_v2.keras",
-            token=HF_TOKEN,
-            local_files_only=False
-        )
-        clf_model = tf.keras.models.load_model(clf_path, compile=False)
+        if clf_model is None:
+            clf_model = tf.keras.models.load_model(
+                f"{MODEL_DIR}/final_brisc_classifier_v2.keras",
+                compile=False
+            )
 
-        seg_path = hf_hub_download(
-            repo_id=REPO_ID,
-            filename="2D_unet_segmentation_model.keras",
-            token=HF_TOKEN,
-            local_files_only=False
-        )
-        seg_model = tf.keras.models.load_model(
-            seg_path,
-            custom_objects={
-                "dice_coef": dice_coef,
-                "dice_loss": dice_loss,
-                "bce_dice_loss": bce_dice_loss
-            },
-            compile=False
-        )
+        if seg_model is None:
+            seg_model = tf.keras.models.load_model(
+                f"{MODEL_DIR}/2D_unet_segmentation_model.keras",
+                custom_objects={
+                    "dice_coef": dice_coef,
+                    "dice_loss": dice_loss,
+                    "bce_dice_loss": bce_dice_loss
+                },
+                compile=False
+            )
 
-        print("Models loaded successfully.")
+        print("Models loaded successfully")
 
     except Exception as e:
         print("MODEL LOAD FAILED:", str(e))
         raise e
 
 # =========================
-# FORCE LOAD AT STARTUP
+# STARTUP
 # =========================
 @app.on_event("startup")
 def startup():
@@ -128,7 +134,7 @@ def create_overlay(image, mask):
     return overlay
 
 # =========================
-# HEALTH CHECK (IMPORTANT)
+# HEALTH CHECK
 # =========================
 @app.get("/")
 def home():
@@ -140,8 +146,6 @@ def home():
 @app.post("/predict")
 async def predict(file: UploadFile = File(...)):
     try:
-        print("Request received")
-
         global clf_model, seg_model
 
         if clf_model is None or seg_model is None:
