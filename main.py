@@ -13,7 +13,7 @@ app = FastAPI(title="Brain Tumor AI API")
 # =========================
 # Hugging Face Config
 # =========================
-HF_TOKEN = "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"  
+HF_TOKEN = os.getenv("HF_TOKEN")
 REPO_ID = "doha14/brain-tumor-models"
 
 # =========================
