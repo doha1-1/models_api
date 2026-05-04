@@ -7,6 +7,7 @@ from io import BytesIO
 from huggingface_hub import hf_hub_download
 import os
 import traceback
+import base64
 
 app = FastAPI(title="Brain Tumor AI API")
 
@@ -17,7 +18,7 @@ HF_TOKEN = os.getenv("HF_TOKEN")
 REPO_ID = "doha14/brain-tumor-models"
 
 # =========================
-# Custom Loss
+# Custom Loss Functions
 # =========================
 def dice_coef(y_true, y_pred, smooth=1e-6):
     y_true = tf.cast(y_true, tf.float32)
@@ -35,11 +36,14 @@ def bce_dice_loss(y_true, y_pred):
     return bce(y_true, y_pred) + dice_loss(y_true, y_pred)
 
 # =========================
-# Lazy Model Loading
+# Global Models (IMPORTANT)
 # =========================
 clf_model = None
 seg_model = None
 
+# =========================
+# Load Models ONCE (FIX)
+# =========================
 def load_models():
     global clf_model, seg_model
 
@@ -68,6 +72,14 @@ def load_models():
         )
 
     return clf_model, seg_model
+
+# =========================
+# LOAD MODELS AT STARTUP (CRITICAL FIX)
+# =========================
+@app.on_event("startup")
+def startup():
+    global clf_model, seg_model
+    clf_model, seg_model = load_models()
 
 # =========================
 # Constants
@@ -108,12 +120,12 @@ def create_overlay(image, mask):
     return overlay
 
 # =========================
-# API Endpoint
+# API ENDPOINT
 # =========================
 @app.post("/predict")
 async def predict(file: UploadFile = File(...)):
     try:
-        clf_model, seg_model = load_models()
+        global clf_model, seg_model
 
         # Read image
         image_bytes = await file.read()
@@ -140,31 +152,35 @@ async def predict(file: UploadFile = File(...)):
             seg_input = preprocess_segmentation(img)
             seg_output = seg_model.predict(seg_input)
 
-            # 🔥 FIX: handle BOTH binary & multi-class
             if seg_output.shape[-1] == 1:
                 seg_pred = seg_output[0, :, :, 0]
                 mask_small = clean_mask(seg_pred)
-
             else:
                 seg_pred = np.argmax(seg_output, axis=-1)[0]
                 mask_small = (seg_pred > 0).astype(np.uint8)
 
-            # Resize correctly
             mask = cv2.resize(
                 mask_small,
                 (img.shape[1], img.shape[0]),
                 interpolation=cv2.INTER_NEAREST
             )
 
+        # =========================
+        # Overlay
+        # =========================
         overlay = create_overlay(img, mask)
 
-        # Encode image
-        _, buffer = cv2.imencode('.png', cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
+        _, buffer = cv2.imencode(
+            '.png',
+            cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR)
+        )
+
+        img_base64 = base64.b64encode(buffer).decode("utf-8")
 
         return {
             "class": pred_class,
             "confidence": confidence,
-            "overlay_image": buffer.tobytes().hex()
+            "overlay_image": img_base64
         }
 
     except Exception as e:
