@@ -3,35 +3,39 @@ import numpy as np
 import cv2
 import os
 
+# 🔥 IMPORTANT: must be before TF import
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 os.environ["TF_FORCE_GPU_ALLOW_GROWTH"] = "true"
 
 import tensorflow as tf
 from PIL import Image
 from io import BytesIO
-from huggingface_hub import snapshot_download
+from huggingface_hub import hf_hub_download
 import traceback
 import base64
+import threading
 
 app = FastAPI(title="Brain Tumor AI API")
 
 # =========================
-# Hugging Face Config
+# CONFIG
 # =========================
 HF_TOKEN = os.getenv("HF_TOKEN")
 REPO_ID = "doha14/brain-tumor-models"
 
-# Cache model download ONCE
-MODEL_DIR = None
+CLASS_NAMES = ['glioma', 'meningioma', 'no_tumor', 'pituitary']
+CLASS_SIZE = (300, 300)
+SEG_SIZE = (256, 256)
 
 # =========================
-# Global Models
+# GLOBAL MODELS
 # =========================
 clf_model = None
 seg_model = None
+model_lock = threading.Lock()  # prevents double loading
 
 # =========================
-# Custom Loss Functions
+# LOSS FUNCTIONS
 # =========================
 def dice_coef(y_true, y_pred, smooth=1e-6):
     y_true = tf.cast(y_true, tf.float32)
@@ -49,77 +53,77 @@ def bce_dice_loss(y_true, y_pred):
     return bce(y_true, y_pred) + dice_loss(y_true, y_pred)
 
 # =========================
-# LOAD MODELS (FIXED)
+# LOAD MODELS (SAFE + SINGLE LOAD)
 # =========================
 def load_models():
-    global clf_model, seg_model, MODEL_DIR
+    global clf_model, seg_model
 
-    print("Loading models...")
+    with model_lock:
+        if clf_model is not None and seg_model is not None:
+            return  # already loaded
 
-    # Download ONCE and reuse cache
-    if MODEL_DIR is None:
-        MODEL_DIR = snapshot_download(
+        print("Loading models...")
+
+        clf_path = hf_hub_download(
             repo_id=REPO_ID,
-            token=HF_TOKEN,
-            cache_dir="/tmp/models"
+            filename="final_brisc_classifier_v2.keras",
+            token=HF_TOKEN
         )
 
-    try:
-        if clf_model is None:
-            clf_model = tf.keras.models.load_model(
-                f"{MODEL_DIR}/final_brisc_classifier_v2.keras",
-                compile=False
-            )
+        seg_path = hf_hub_download(
+            repo_id=REPO_ID,
+            filename="2D_unet_segmentation_model.keras",
+            token=HF_TOKEN
+        )
 
-        if seg_model is None:
-            seg_model = tf.keras.models.load_model(
-                f"{MODEL_DIR}/2D_unet_segmentation_model.keras",
-                custom_objects={
-                    "dice_coef": dice_coef,
-                    "dice_loss": dice_loss,
-                    "bce_dice_loss": bce_dice_loss
-                },
-                compile=False
-            )
+        clf_model = tf.keras.models.load_model(clf_path, compile=False)
 
-        print("Models loaded successfully")
+        seg_model = tf.keras.models.load_model(
+            seg_path,
+            custom_objects={
+                "dice_coef": dice_coef,
+                "dice_loss": dice_loss,
+                "bce_dice_loss": bce_dice_loss
+            },
+            compile=False
+        )
 
-    except Exception as e:
-        print("MODEL LOAD FAILED:", str(e))
-        raise e
+        print("Models loaded successfully.")
 
 # =========================
-# STARTUP
+# STARTUP (SAFE)
 # =========================
 @app.on_event("startup")
 def startup():
-    load_models()
+    try:
+        load_models()
+    except Exception as e:
+        print("MODEL LOAD FAILED:", str(e))
 
 # =========================
-# CONSTANTS
+# HEALTH CHECK
 # =========================
-CLASS_NAMES = ['glioma', 'meningioma', 'no_tumor', 'pituitary']
-CLASS_SIZE = (300, 300)
-SEG_SIZE = (256, 256)
+@app.get("/")
+def home():
+    return {
+        "status": "running",
+        "clf_loaded": clf_model is not None,
+        "seg_loaded": seg_model is not None
+    }
 
 # =========================
 # PREPROCESSING
 # =========================
-def preprocess_classification(img):
-    img = cv2.resize(img, CLASS_SIZE)
-    img = img.astype(np.float32) / 255.0
-    return np.expand_dims(img, axis=0)
-
-def preprocess_segmentation(img):
-    img = cv2.resize(img, SEG_SIZE)
+def preprocess(img, size):
+    img = cv2.resize(img, size)
     img = img.astype(np.float32) / 255.0
     return np.expand_dims(img, axis=0)
 
 # =========================
-# POSTPROCESSING
+# MASK PROCESSING
 # =========================
-def clean_mask(mask, threshold=0.5):
-    return (mask > threshold).astype(np.uint8)
+def clean_mask(mask):
+    return (mask > 0.5).astype(np.uint8)
 
 def create_overlay(image, mask):
     overlay = image.copy()
@@ -134,54 +138,38 @@ def create_overlay(image, mask):
     return overlay
 
 # =========================
-# HEALTH CHECK
-# =========================
-@app.get("/")
-def home():
-    return {"status": "API running"}
-
-# =========================
-# PREDICT ENDPOINT
+# PREDICT
 # =========================
 @app.post("/predict")
 async def predict(file: UploadFile = File(...)):
     try:
-        global clf_model, seg_model
+        load_models()  # safety check
 
-        if clf_model is None or seg_model is None:
-            load_models()
-
-        # Read image
+        # read image
         image_bytes = await file.read()
         image = Image.open(BytesIO(image_bytes)).convert("RGB")
         img = np.array(image)
 
-        # =========================
-        # Classification
-        # =========================
-        clf_input = preprocess_classification(img)
+        # ================= CLASSIFICATION =================
+        clf_input = preprocess(img, CLASS_SIZE)
         preds = clf_model.predict(clf_input, verbose=0)[0]
 
-        pred_idx = int(np.argmax(preds))
-        pred_class = CLASS_NAMES[pred_idx]
-        confidence = float(preds[pred_idx])
+        idx = int(np.argmax(preds))
+        pred_class = CLASS_NAMES[idx]
+        confidence = float(preds[idx])
 
-        # =========================
-        # Segmentation
-        # =========================
+        # ================= SEGMENTATION =================
         if pred_class == "no_tumor":
             mask = np.zeros(img.shape[:2], dtype=np.uint8)
 
         else:
-            seg_input = preprocess_segmentation(img)
+            seg_input = preprocess(img, SEG_SIZE)
             seg_output = seg_model.predict(seg_input, verbose=0)
 
             if seg_output.shape[-1] == 1:
-                seg_pred = seg_output[0, :, :, 0]
-                mask_small = clean_mask(seg_pred)
+                mask_small = clean_mask(seg_output[0, :, :, 0])
             else:
-                seg_pred = np.argmax(seg_output, axis=-1)[0]
-                mask_small = (seg_pred > 0).astype(np.uint8)
+                mask_small = (np.argmax(seg_output, axis=-1)[0] > 0).astype(np.uint8)
 
             mask = cv2.resize(
                 mask_small,
@@ -189,16 +177,10 @@ async def predict(file: UploadFile = File(...)):
                 interpolation=cv2.INTER_NEAREST
             )
 
-        # =========================
-        # Overlay
-        # =========================
+        # ================= OVERLAY =================
         overlay = create_overlay(img, mask)
 
-        _, buffer = cv2.imencode(
-            '.png',
-            cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR)
-        )
-
+        _, buffer = cv2.imencode('.png', cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
         img_base64 = base64.b64encode(buffer).decode("utf-8")
 
         return {
@@ -208,7 +190,6 @@ async def predict(file: UploadFile = File(...)):
         }
 
     except Exception as e:
-        print("ERROR:", str(e))
         return {
             "error": str(e),
             "trace": traceback.format_exc()
